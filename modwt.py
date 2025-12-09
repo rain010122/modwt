@@ -31,65 +31,64 @@ class MODWTPeriodExtractor:
             data = np.pad(data, (0, pad_width), 'reflect')
         return data, n  # 返回填充后的数据和原始长度
 
-    def extract(self, data_series, input_name="Series"):
-        """
-        执行 MODWT 并提取主导周期
-        :param data_series: 一维 numpy 数组 (T,)
-        :param input_name: 用于绘图的标题
-        :return: 包含 (周期, 能量) 的字典列表
-        """
-        # 1. 确定最大分解层数 J <= log2(L)
-        L = len(data_series)
-        max_level = int(np.floor(np.log2(L)))
-        # 为了避免边界严重失真，通常保留一些余量，比如取 min(8, log2(L))
-        # 这里的 8 意味着最大能检测 2^8 = 256 的周期，对于 Traffic/ETT 足够
-        decompose_level = min(8, max_level) 
+    def extract(self, data_series, input_name="Series", max_allowed_period=None):
+            """
+            执行 MODWT 并提取主导周期
+            :param data_series: 一维 numpy 数组
+            :param input_name: 数据集名称
+            :param max_allowed_period: 【新增】最大允许的周期长度 (对应模型 Look-back Window)
+            :return: 结果字典
+            """
+            L = len(data_series)
+            max_level = int(np.floor(np.log2(L)))
+            # 保证分解层数足够深，能覆盖到 max_allowed_period
+            # 但也不要太深，通常 12 层足够覆盖 4096 (15分钟数据的月周期)
+            decompose_level = min(12, max_level)
 
-        # 2. 序列补齐 (Padding) - SWT/MODWT 需要特定长度
-        padded_data, original_len = self._pad_sequence(data_series, decompose_level)
+            # 序列补齐
+            padded_data, original_len = self._pad_sequence(data_series, decompose_level)
 
-        # 3. 执行 MODWT (利用 PyWavelets 的 swt)
-        # coeffs 结构: [(cA_n, cD_n), ..., (cA_1, cD_1)]
-        coeffs = pywt.swt(padded_data, self.wavelet_name, level=decompose_level, trim_approx=True)
-        
-        # 4. 计算小波能量谱 (Wavelet Variance)
-        variances = []
-        periods = []
-        
-        # coeffs 列表是从深层(低频)到浅层(高频)排列的
-        # level j 对应 coeffs[-(j)] 的细节系数 cD
-        # 我们按照 level 1, 2, ..., J 的顺序遍历
-        for j in range(1, decompose_level + 1):
-            # 获取第 j 层的细节系数 (Detail Coefficients)
-            # swt 返回的是 [(cA_J, cD_J), (cA_J-1, cD_J-1), ..., (cA_1, cD_1)]
-            # 所以 level 1 对应索引 -1
-            cD_j = coeffs[-j][1] 
+            # MODWT 分解
+            coeffs = pywt.swt(padded_data, self.wavelet_name, level=decompose_level)
             
-            # 截断回原始长度，去除 Padding 部分
-            cD_j = cD_j[:original_len]
+            candidates = [] # 存储 (period, energy)
             
-            # 计算无偏估计的方差 (能量)
-            energy = np.var(cD_j)
-            variances.append(energy)
-            
-            # 映射为周期 P = 2^j
-            periods.append(2 ** j)
+            # 遍历每一层
+            for j in range(1, decompose_level + 1):
+                period = 2 ** j
+                
+                # 【核心修改】：如果在计算能量前发现周期已经超标，直接跳过
+                # 这样趋势项的能量再大，也不会进入 candidates 列表
+                if max_allowed_period is not None and period > max_allowed_period:
+                    continue
 
-        # 5. Top-k 筛选
-        # 将周期和能量组合，按能量降序排列
-        period_energy_pairs = list(zip(periods, variances))
-        sorted_pairs = sorted(period_energy_pairs, key=lambda x: x[1], reverse=True)
-        
-        top_k_periods = sorted_pairs[:self.top_k]
-        
-        # 简单打印日志
-        print(f"[{input_name}] Extracted Top-{self.top_k} Periods: {[p for p, e in top_k_periods]}")
-        
-        return {
-            "all_energies": variances,
-            "all_periods": periods,
-            "top_k": top_k_periods
-        }
+                # 获取细节系数 cD
+                cD_j = coeffs[-j][1] 
+                cD_j = cD_j[:original_len]
+                energy = np.var(cD_j)
+                
+                candidates.append((period, energy))
+                
+            # Top-k 筛选
+            # 现在 candidates 里全是合规的周期，按能量排序即可
+            sorted_candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+            top_k_periods = sorted_candidates[:self.top_k]
+            
+            # 提取用于绘图的全谱数据 (为了画图好看，我们还是把所有的存下来，但在 top_k 里不显示)
+            all_periods = [2**j for j in range(1, decompose_level+1)]
+            # 这里为了简单，只存合规的能量，不合规的补0或者重算一遍
+            # 简单起见，我们重新遍历一遍只为画图 (画图可以画出趋势，但选只能选局部)
+            # 但为了逻辑简单，这里只返回 candidates 里的数据用于画图也行
+            # 或者为了严谨，我们仅返回合规的用于 Top-K，画图数据可以在外部不管
+            
+            print(f"[{input_name}] Constraints(<= {max_allowed_period}): Top-{self.top_k} -> {[p for p, e in top_k_periods]}")
+            
+            return {
+                # 画图用的数据，我们可以简单造一下，只包含合规的，或者你保留上面的逻辑
+                "all_periods": [p for p,e in candidates], 
+                "all_energies": [e for p,e in candidates],
+                "top_k": top_k_periods
+            }
 
     def plot_spectrum(self, results, save_path=None):
         """

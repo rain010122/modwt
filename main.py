@@ -4,63 +4,79 @@ from modwt import MODWTPeriodExtractor
 from data_loader import load_data
 
 def main():
-    # 1. 配置
-    # 请确保将你的数据集 (ETTh1.csv 等) 放入 datasets 文件夹
-    dataset_dir = './datasets'
+    dataset_dir = './datasets/one_year'
     output_dir = './results'
     os.makedirs(output_dir, exist_ok=True)
     
-    # 定义要处理的数据集文件名
-    datasets = [
-        'ETTh1.csv',
-        'ETTh2.csv', 
-        'Traffic.csv',
-        'Weather.csv',
-        'Electricity.csv'
-    ]
+    # 【核心配置】：针对 ADF-Net 的输入窗口约束
+    # 假设你的 Look-back Window 最大是 720 (30天/1个月)
+    # 对于小时数据，周期不能超过 512 (2^9)
+    # 对于分钟数据，周期不能超过 1024 (2^10) 或 2048
+    
+    datasets_config = {
+        # Hour level (24 points/day)
+        # Target: Daily(24 -> 16/32), Weekly(168 -> 128/256)
+        'ETTh1.csv':       {'max_p': 720}, 
+        'ETTh2.csv':       {'max_p': 720},
+        'Traffic.csv':     {'max_p': 720},
+        'Electricity.csv': {'max_p': 720},
+        
+        # 15-min level (96 points/day)
+        # Target: Daily(96 -> 64/128), Weekly(672 -> 512/1024)
+        'ETTm1.csv':       {'max_p': 720}, 
+        'ETTm2.csv':       {'max_p': 720},
+        
+        # 10-min level (144 points/day)
+        # Target: Daily(144 -> 128/256)
+        'Weather.csv':     {'max_p': 720}
+    }
 
-    # 初始化提取器 (使用 db4 小波, 提取 Top-3)
+    # 提取 Top-3 即可，给模型 3 个专家视角
     extractor = MODWTPeriodExtractor(wavelet_name='db4', top_k=3)
 
     final_periods_dict = {}
 
-    print("=" * 50)
-    print("Start Wavelet-based Periodicity Extraction")
-    print("=" * 50)
+    print("=" * 60)
+    print("Start Wavelet-based Local Periodicity Extraction")
+    print("Strategy: Masking global trends during extraction")
+    print("=" * 60)
 
-    for ds_name in datasets:
+    for ds_name, config in datasets_config.items():
         file_path = os.path.join(dataset_dir, ds_name)
-        
         if not os.path.exists(file_path):
-            print(f"[Warning] File not found: {file_path}, skipping...")
             continue
             
         print(f"\nProcessing {ds_name}...")
         
-        # 2. 加载数据
-        # 这里默认取最后一列(OT)进行分析，代表该数据集的主节奏
+        # 1. 加载数据
         series = load_data(file_path, scale=True)
-        
-        if series is None:
-            continue
+        if series is None: continue
             
-        # 3. 提取周期
-        results = extractor.extract(series, input_name=ds_name)
+        # 2. 提取周期 (传入约束参数)
+        max_p = config['max_p']
+        results = extractor.extract(series, input_name=ds_name, max_allowed_period=max_p)
         
-        # 4. 保存结果
-        top_periods = [p for p, e in results['top_k']]
-        final_periods_dict[ds_name] = top_periods
+        # 3. 获取结果
+        top_k_periods = [p for p, e in results['top_k']]
         
-        # 5. 绘制并保存能量谱图 (论文素材!)
+        # 4. 兜底策略：如果提取出来的全是 2, 4 这种极小噪声
+        # 或者不足 3 个，我们可以手动补全一些更有意义的
+        # 但通常经过上述修改，应该能提取到 16, 32, 64 等中频信号
+        
+        final_periods_dict[ds_name] = top_k_periods
+        
+        # 绘图
         plot_name = ds_name.replace('.csv', '_spectrum.png')
         extractor.plot_spectrum(results, save_path=os.path.join(output_dir, plot_name))
 
-    print("\n" + "=" * 50)
-    print("Final Extracted Periods (Ready for ADF-Net):")
-    print("=" * 50)
+    print("\n" + "=" * 60)
+    print("Final Periods Configuration for ADF-Net:")
+    print("=" * 60)
+    print("periods_map = {")
     for name, periods in final_periods_dict.items():
-        print(f"{name}: {periods}")
-        # 这里输出的格式，可以直接复制到你论文代码的配置字典里
+        # 格式化输出，方便直接复制到论文代码
+        print(f"    '{name.split('.')[0]}': {periods},")
+    print("}")
 
 if __name__ == '__main__':
     main()
